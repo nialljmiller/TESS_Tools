@@ -182,24 +182,72 @@ def load_catalogue(cat_path, ra_col, dec_col, fits_ext=1):
     return df[mask].reset_index(drop=True), ra[mask], dec[mask]
 
 
+
+def load_catalogue(cat_path, ra_col, dec_col, fits_ext=1):
+    """Load catalogue as a DataFrame from FITS or CSV.
+    Returns (df, ra_array, dec_array) or (None, None, None) if not found."""
+    cat_path = Path(cat_path).expanduser()
+    if not cat_path.exists():
+        print(f"[warn] Catalogue not found: {cat_path}")
+        return None, None, None
+
+    try:
+        with fits.open(cat_path) as hdul:
+            data = hdul[fits_ext].data
+            if data is None:
+                raise ValueError("Empty HDU")
+            df = pd.DataFrame({col: np.asarray(data[col]) for col in data.columns.names})
+        print(f"Loaded FITS catalogue: {cat_path}  ({len(df):,} rows)")
+    except Exception as e_fits:
+        try:
+            df = pd.read_csv(cat_path)
+            print(f"Loaded CSV catalogue: {cat_path}  ({len(df):,} rows)")
+        except Exception as e_csv:
+            print(f"[warn] Could not load catalogue.\n  FITS error: {e_fits}\n  CSV error: {e_csv}")
+            return None, None, None
+
+    for col in (ra_col, dec_col):
+        if col not in df.columns:
+            raise KeyError(f"Column '{col}' not found. Available: {df.columns.tolist()}")
+
+    before = len(df)
+    df = df.drop_duplicates(subset=[ra_col, dec_col]).reset_index(drop=True)
+    if len(df) < before:
+        print(f"  Deduplicated {before:,} rows -> {len(df):,} unique targets on ({ra_col}, {dec_col})")
+
+    ra  = np.asarray(df[ra_col],  dtype=float)
+    dec = np.asarray(df[dec_col], dtype=float)
+    mask = np.isfinite(ra) & np.isfinite(dec)
+    return df[mask].reset_index(drop=True), ra[mask], dec[mask]
+
+
+
+
+
 # ---------------------------
 # Observation counting
 # ---------------------------
 
 def count_observations_for_catalogue(ra_arr, dec_arr, sectors, scinfo_global):
     """
-    For every target in ra_arr/dec_arr, count how many unique Cycle 9
-    sectors observe it.  Returns an int array of length N.
+    For every target return three int arrays:
+      n_new   — unique Cycle 9 sectors (sectors list) that observe it
+      n_old   — unique pre-Cycle-9 sectors that observe it
+      n_total — n_new + n_old
     """
     sector_set = set(sectors)
-    n_obs = np.zeros(len(ra_arr), dtype=int)
+    n_new   = np.zeros(len(ra_arr), dtype=int)
+    n_old   = np.zeros(len(ra_arr), dtype=int)
     for i, (ra, dec) in enumerate(zip(ra_arr, dec_arr)):
         _, _, _, outSec, _, _, _, _, _ = tess_stars2px_function_entry(
             i, ra, dec, scInfo=scinfo_global
         )
         if outSec is not None and len(outSec) > 0:
-            n_obs[i] = len({int(s) for s in outSec if int(s) in sector_set})
-    return n_obs
+            all_secs = {int(s) for s in outSec}
+            n_new[i] = len(all_secs & sector_set)
+            n_old[i] = len(all_secs - sector_set)
+    n_total = n_new + n_old
+    return n_new, n_old, n_total
 
 
 # ---------------------------
@@ -316,7 +364,7 @@ def plot_galactic(sectors, scinfo_global, cmap, norm, ra, dec, cvals):
 # ---------------------------
 
 def _make_nobs_cmap_norm(max_obs):
-    nobs_cmap = plt.get_cmap("jet", max_obs + 1)
+    nobs_cmap = plt.get_cmap("tab20b", max_obs + 1)
     nobs_norm = BoundaryNorm(np.arange(-0.5, max_obs + 1.5), nobs_cmap.N)
     return nobs_cmap, nobs_norm
 
@@ -366,66 +414,139 @@ def plot_galactic_nobs(sectors, scinfo_global, cmap, norm, ra, dec, n_obs):
 # n_obs only plots (single nobs colorbar, no sector colorbar)
 # ---------------------------
 
-def plot_equatorial_nobs_only(sectors, scinfo_global, cmap, norm, ra, dec, n_obs):
-    max_obs              = max(int(n_obs.max()), 1)
-    nobs_cmap, nobs_norm = _make_nobs_cmap_norm(max_obs)
+def _make_nobs_cmap_norm_for(arr):
+    max_obs = max(int(arr.max()), 1)
+    cmap = plt.get_cmap("tab20b", max_obs + 1)
+    norm = BoundaryNorm(np.arange(-0.5, max_obs + 1.5), cmap.N)
+    return cmap, norm, max_obs
 
-    fig = plt.figure(figsize=(10, 4.8), dpi=220)
-    ax  = fig.add_subplot(111, projection="mollweide")
-    fig.subplots_adjust(left=0.03, right=0.92, top=0.97, bottom=0.03)
-    ax.grid(True, linewidth=0.6, alpha=0.6)
-    _draw_tess_fields_equatorial(ax, sectors, scinfo_global, cmap, norm)
-    sc = _scatter_nobs(ax, ra_to_mollweide_x(ra), lat_to_mollweide_y(dec),
-                       n_obs, nobs_cmap, nobs_norm)
-    cax = fig.add_axes([0.935, 0.05, 0.018, 0.91])
-    cb  = fig.colorbar(sc, cax=cax, orientation="vertical")
-    cb.set_label("N TESS obs", fontsize=8)
-    cb.set_ticks(np.arange(0, max_obs + 1))
-    cb.ax.tick_params(labelsize=7)
+
+def _panel_mollweide(fig, rect, projection_type, sectors, scinfo_global, px, py, arr, title):
+    """Draw one Mollweide panel into fig at position rect=[left,bottom,width,height]."""
+    ax = fig.add_axes(rect, projection="mollweide")
+    ax.grid(True, linewidth=0.5, alpha=0.5)
+
+    # draw grey TESS fields
+    if projection_type == "equatorial":
+        lam  = np.linspace(0, 360, 1500) * u.deg
+        beta = np.zeros(1500) * u.deg
+        ecl  = SkyCoord(lon=lam, lat=beta, distance=1*u.au,
+                        frame=BarycentricTrueEcliptic).transform_to("icrs")
+        ax.plot(ra_to_mollweide_x(ecl.ra.deg), lat_to_mollweide_y(ecl.dec.deg),
+                linewidth=3, alpha=0.25, color="steelblue")
+        for sec in sectors:
+            scinfo = get_scinfo_for_sector(sec, scinfo_global)
+            for cam in range(1, 5):
+                for ccd in range(1, 5):
+                    ras, decs = ccd_outline_radec(sec, cam, ccd, scinfo, n_edge=1)
+                    x, y = break_wrap(ra_to_mollweide_x(ras), lat_to_mollweide_y(decs))
+                    ax.plot(x, y, linewidth=0.6, color="0.65", alpha=0.7)
+    else:
+        l = np.linspace(0, 360, 1500)
+        ax.plot(lon_to_mollweide_x(l), lat_to_mollweide_y(np.zeros_like(l)),
+                linewidth=3, alpha=0.25, color="steelblue")
+        for sec in sectors:
+            scinfo = get_scinfo_for_sector(sec, scinfo_global)
+            for cam in range(1, 5):
+                for ccd in range(1, 5):
+                    ras, decs = ccd_outline_radec(sec, cam, ccd, scinfo, n_edge=25)
+                    g = SkyCoord(ra=ras*u.deg, dec=decs*u.deg, frame="icrs").galactic
+                    x, y = break_wrap(lon_to_mollweide_x(g.l.deg), lat_to_mollweide_y(g.b.deg))
+                    ax.plot(x, y, linewidth=0.6, color="0.65", alpha=0.7)
+
+    cmap, norm, max_obs = _make_nobs_cmap_norm_for(arr)
+    mask = arr > 0
+    sc = ax.scatter(np.asarray(px)[mask], np.asarray(py)[mask],
+                    s=POINT_STYLE["size"], c=arr[mask],
+                    cmap=cmap, norm=norm,
+                    marker=POINT_STYLE["marker"],
+                    alpha=POINT_STYLE["alpha"], linewidths=0)
+
+    ax.set_title(title, fontsize=9, pad=3)
+    return ax, sc, cmap, norm, max_obs
+
+
+def _three_panel_sky(sectors, scinfo_global, ra, dec, n_new, n_old, n_total, projection_type):
+    """
+    3-panel Mollweide figure: old / new / total observations.
+    projection_type: "equatorial" or "galactic"
+    """
+    if projection_type == "equatorial":
+        px = ra_to_mollweide_x(ra)
+        py = lat_to_mollweide_y(dec)
+    else:
+        g  = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame="icrs").galactic
+        px = lon_to_mollweide_x(g.l.deg)
+        py = lat_to_mollweide_y(g.b.deg)
+
+    fig = plt.figure(figsize=(10, 11), dpi=220)
+
+    panels = [
+        (n_old,   "Prior cycles (old)"),
+        (n_new,   "Cycle 9 (new)"),
+        (n_total, "All cycles (total)"),
+    ]
+
+    # 3 rows; each row: plot takes left=0.03..0.88, colorbar 0.90..0.925
+    row_h  = 0.30
+    gap    = 0.03
+    cb_w   = 0.018
+    cb_l   = 0.905
+
+    for idx, (arr, title) in enumerate(panels):
+        bottom = 0.02 + (2 - idx) * (row_h + gap)
+        rect   = [0.03, bottom, 0.87, row_h]
+        ax, sc, cmap, norm, max_obs = _panel_mollweide(
+            fig, rect, projection_type, sectors, scinfo_global, px, py, arr, title
+        )
+        cax = fig.add_axes([cb_l, bottom + 0.01, cb_w, row_h - 0.02])
+        cb  = fig.colorbar(sc, cax=cax, orientation="vertical")
+        cb.set_label("N obs", fontsize=7)
+        cb.set_ticks(np.arange(0, max_obs + 1))
+        cb.ax.tick_params(labelsize=6)
+
     return fig
 
 
-def plot_galactic_nobs_only(sectors, scinfo_global, cmap, norm, ra, dec, n_obs):
-    max_obs              = max(int(n_obs.max()), 1)
-    nobs_cmap, nobs_norm = _make_nobs_cmap_norm(max_obs)
-
-    fig = plt.figure(figsize=(10, 4.8), dpi=220)
-    ax  = fig.add_subplot(111, projection="mollweide")
-    fig.subplots_adjust(left=0.03, right=0.92, top=0.97, bottom=0.03)
-    ax.grid(True, linewidth=0.6, alpha=0.6)
-    _draw_tess_fields_galactic(ax, sectors, scinfo_global, cmap, norm)
-    g  = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame="icrs").galactic
-    sc = _scatter_nobs(ax, lon_to_mollweide_x(g.l.deg), lat_to_mollweide_y(g.b.deg),
-                       n_obs, nobs_cmap, nobs_norm)
-    cax = fig.add_axes([0.935, 0.05, 0.018, 0.91])
-    cb  = fig.colorbar(sc, cax=cax, orientation="vertical")
-    cb.set_label("N TESS obs", fontsize=8)
-    cb.set_ticks(np.arange(0, max_obs + 1))
-    cb.ax.tick_params(labelsize=7)
-    return fig
+def plot_sky_obs_equatorial(sectors, scinfo_global, ra, dec, n_new, n_old, n_total):
+    return _three_panel_sky(sectors, scinfo_global, ra, dec, n_new, n_old, n_total, "equatorial")
 
 
+def plot_sky_obs_galactic(sectors, scinfo_global, ra, dec, n_new, n_old, n_total):
+    return _three_panel_sky(sectors, scinfo_global, ra, dec, n_new, n_old, n_total, "galactic")
 
-def plot_nobs_histogram(n_obs):
-    max_obs = int(n_obs.max())
+
+def plot_nobs_histogram(n_new, n_old, n_total):
+    all_arrays = [n_old, n_new, n_total]
+    max_obs = max(int(a.max()) for a in all_arrays)
     bins    = np.arange(-0.5, max_obs + 1.5)
+    x       = np.arange(0, max_obs + 1)
+    w       = 0.26
 
-    fig, ax = plt.subplots(figsize=(8, 5), dpi=180)
-    ax.hist(n_obs, bins=bins, color="steelblue", edgecolor="white", linewidth=0.6)
-    ax.set_xlabel("N TESS Cycle 9 sectors observing target")
+    colors = ["royalblue", "tomato", "mediumpurple"]
+    labels = ["Prior cycles (old)", "Cycle 9 (new)", "All cycles (total)"]
+
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=180)
+    for shift, arr, color, label in zip([-w, 0, w], all_arrays, colors, labels):
+        counts, _ = np.histogram(arr, bins=bins)
+        ax.bar(x + shift, counts, width=w, color=color, label=label,
+               edgecolor="white", linewidth=0.4, alpha=0.9)
+
+    ax.set_xlabel("Number of TESS sectors observing target")
     ax.set_ylabel("Number of targets")
-    ax.set_title("Distribution of TESS Cycle 9 observations")
-    ax.set_xticks(np.arange(0, max_obs + 1))
-    ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(lambda x, _: f"{int(x):,}"))
+    ax.set_title("TESS observation counts: prior cycles vs Cycle 9 vs total")
+    ax.set_xticks(x)
+    ax.legend(fontsize=9)
+    ax.yaxis.set_major_formatter(mpl.ticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
 
-    total    = len(n_obs)
-    observed1 = int((n_obs > 1).sum())
-    observed2 = int((n_obs > 2).sum())
-    observed3 = int((n_obs > 3).sum())
-    ax.text(0.98, 0.97,
-            f"Total targets : {total:,}\nObserved >=2x : {observed1:,}  ({100*observed1/total:.1f}%)\nObserved >=3x : {observed2:,}  ({100*observed2/total:.1f}%)\nObserved >=4x : {observed3:,}  ({100*observed3/total:.1f}%)",
-            transform=ax.transAxes, ha="right", va="top",
-            fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.8))
+    total = len(n_new)
+    lines = [f"Total targets : {total:,}"]
+    for arr, label in zip(all_arrays, labels):
+        obs = int((arr > 0).sum())
+        lines.append(f"{label:25s}: {obs:,}  ({100*obs/total:.1f}% observed)")
+    ax.text(0.98, 0.97, "\n".join(lines),
+            transform=ax.transAxes, ha="right", va="top", fontsize=8,
+            bbox=dict(boxstyle="round", fc="white", alpha=0.85))
     plt.tight_layout()
     return fig
 
@@ -434,20 +555,21 @@ def plot_nobs_histogram(n_obs):
 # Write catalogue with n_obs appended
 # ---------------------------
 
-def write_catalogue_with_nobs(df, n_obs, cat_path, out_col="n_tess_cycle9_obs"):
+def write_catalogue_with_nobs(df, n_new, n_old, n_total, cat_path):
     df = df.copy()
-    df[out_col] = n_obs
+    df["n_tess_cycle9_obs"]  = n_new
+    df["n_tess_prior_obs"]   = n_old
+    df["n_tess_total_obs"]   = n_total
     cat_path = Path(cat_path).expanduser()
     out_path = cat_path.parent / (cat_path.stem + "_tess_nobs" + cat_path.suffix)
 
     if cat_path.suffix.lower() in (".fits", ".fit"):
         from astropy.table import Table
-        t = Table.from_pandas(df)
-        t.write(str(out_path), overwrite=True)
+        Table.from_pandas(df).write(str(out_path), overwrite=True)
     else:
         df.to_csv(out_path, index=False)
 
-    print(f"Wrote catalogue with n_obs column: {out_path.resolve()}")
+    print(f"Wrote catalogue with n_obs columns: {out_path.resolve()}")
     return out_path
 
 
@@ -485,6 +607,9 @@ def main():
         sectors       = write_cycle9_override(override_path)
         scinfo_global = TESS_Spacecraft_Pointing_Data(sectorOverrideFile=str(override_path))
 
+
+
+
     cmap = plt.get_cmap("viridis", len(sectors))
     norm = mpl.colors.Normalize(vmin=min(sectors), vmax=max(sectors))
 
@@ -497,6 +622,14 @@ def main():
         params["catalogue"], params["ra_col"], params["dec_col"], params["fits_ext"]
     )
 
+
+    # Count TESS observations for every target
+    n_new = n_old = n_total = None
+    if ra is not None:
+        print(f"Computing TESS observations for {len(ra):,} targets ...")
+        n_new, n_old, n_total = count_observations_for_catalogue(ra, dec, sectors, scinfo_global)
+        print(f"  Done.  Cycle 9: {(n_new>0).sum():,} observed | Prior: {(n_old>0).sum():,} | Total: {(n_total>0).sum():,}")
+
     # cvals for POINT_STYLE colourbar
     cvals = None
     if df is not None and POINT_STYLE["colorbar_col"] is not None:
@@ -506,12 +639,33 @@ def main():
         else:
             print(f"[warn] colorbar_col '{col}' not found in catalogue -- using fixed colour")
 
-    # Count TESS observations for every target
-    n_obs = None
-    if ra is not None:
-        print(f"Computing TESS Cycle 9 observations for {len(ra):,} targets ...")
-        n_obs = count_observations_for_catalogue(ra, dec, sectors, scinfo_global)
-        print(f"  Done.  {(n_obs > 0).sum():,} targets observed at least once.")
+    if n_new is not None:
+        # 3-panel sky maps (old / new / total)
+        fig_eq = plot_sky_obs_equatorial(sectors, scinfo_global, ra, dec, n_new, n_old, n_total)
+        p = parent / f"{stem}_equatorial_obs_breakdown.png"
+        fig_eq.savefig(p, dpi=220);  plt.close(fig_eq);  print(f"Wrote: {p.resolve()}")
+
+        fig_gal = plot_sky_obs_galactic(sectors, scinfo_global, ra, dec, n_new, n_old, n_total)
+        p = parent / f"{stem}_galactic_obs_breakdown.png"
+        fig_gal.savefig(p, dpi=220);  plt.close(fig_gal);  print(f"Wrote: {p.resolve()}")
+
+        # Histogram
+        fig_hist = plot_nobs_histogram(n_new, n_old, n_total)
+        p = parent / f"{stem}_nobs_histogram.png"
+        fig_hist.savefig(p, dpi=180);  plt.close(fig_hist);  print(f"Wrote: {p.resolve()}")
+
+        # n_obs+sector stacked colourbar figures
+        fig3 = plot_equatorial_nobs(sectors, scinfo_global, cmap, norm, ra, dec, n_new)
+        p = parent / f"{stem}_equatorial_nobs.png"
+        fig3.savefig(p, dpi=220);  plt.close(fig3);  print(f"Wrote: {p.resolve()}")
+
+        fig4 = plot_galactic_nobs(sectors, scinfo_global, cmap, norm, ra, dec, n_new)
+        p = parent / f"{stem}_galactic_nobs.png"
+        fig4.savefig(p, dpi=220);  plt.close(fig4);  print(f"Wrote: {p.resolve()}")
+
+        # Write catalogue
+        if df is not None:
+            write_catalogue_with_nobs(df, n_new, n_old, n_total, params["catalogue"])
 
     # Standard overlay figures
     fig1 = plot_equatorial(sectors, scinfo_global, cmap, norm, ra, dec, cvals)
@@ -521,34 +675,6 @@ def main():
     fig2 = plot_galactic(sectors, scinfo_global, cmap, norm, ra, dec, cvals)
     p = parent / f"{stem}_galactic.png"
     fig2.savefig(p, dpi=220);  plt.close(fig2);  print(f"Wrote: {p.resolve()}")
-
-    if n_obs is not None:
-        # n_obs overlay figures
-        fig3 = plot_equatorial_nobs(sectors, scinfo_global, cmap, norm, ra, dec, n_obs)
-        p = parent / f"{stem}_equatorial_nobs.png"
-        fig3.savefig(p, dpi=220);  plt.close(fig3);  print(f"Wrote: {p.resolve()}")
-
-        fig4 = plot_galactic_nobs(sectors, scinfo_global, cmap, norm, ra, dec, n_obs)
-        p = parent / f"{stem}_galactic_nobs.png"
-        fig4.savefig(p, dpi=220);  plt.close(fig4);  print(f"Wrote: {p.resolve()}")
-
-        # n_obs only figures (single nobs colorbar, no sector colorbar)
-        fig6 = plot_equatorial_nobs_only(sectors, scinfo_global, cmap, norm, ra, dec, n_obs)
-        p = parent / f"{stem}_equatorial_nobs_only.png"
-        fig6.savefig(p, dpi=220);  plt.close(fig6);  print(f"Wrote: {p.resolve()}")
-
-        fig7 = plot_galactic_nobs_only(sectors, scinfo_global, cmap, norm, ra, dec, n_obs)
-        p = parent / f"{stem}_galactic_nobs_only.png"
-        fig7.savefig(p, dpi=220);  plt.close(fig7);  print(f"Wrote: {p.resolve()}")
-
-        # Histogram
-        fig5 = plot_nobs_histogram(n_obs)
-        p = parent / f"{stem}_nobs_histogram.png"
-        fig5.savefig(p, dpi=180);  plt.close(fig5);  print(f"Wrote: {p.resolve()}")
-
-        # Write catalogue with n_obs column appended
-        if df is not None:
-            write_catalogue_with_nobs(df, n_obs, params["catalogue"])
 
 
 if __name__ == "__main__":
